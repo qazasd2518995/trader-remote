@@ -14,7 +14,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, List
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from copy_trader.config import DATA_DIR, DEFAULT_SYMBOL, load_config
 from copy_trader.signal_parser.regex_parser import ParsedSignal
@@ -93,13 +94,64 @@ def _is_executable_signal(signal: ParsedSignal) -> bool:
     )
 
 
+def _client_signal_key(signal: ParsedSignal, source: str) -> Tuple:
+    """會員端用的訊號去重 key — 與中央 _signal_key 同邏輯，避免同一訊號 MT5 端重下單。"""
+    tps = tuple(round(float(tp), 2) for tp in (signal.take_profit or []) if tp is not None)
+    return (
+        str(source or ""),
+        str(signal.direction or ""),
+        round(float(signal.entry_price or 0), 2),
+        bool(signal.is_market_order),
+        round(float(signal.stop_loss or 0), 2),
+        tps,
+    )
+
+
+def _signal_summary(signal: ParsedSignal) -> str:
+    """給 UI 顯示用的訊號摘要文字。"""
+    direction = (signal.direction or "?").upper()
+    entry = "市價" if signal.is_market_order else (f"{float(signal.entry_price):.2f}" if signal.entry_price is not None else "-")
+    sl = f"{float(signal.stop_loss):.2f}" if signal.stop_loss is not None else "-"
+    tps = ", ".join(f"{float(tp):.2f}" for tp in (signal.take_profit or []) if tp is not None) or "-"
+    return f"{direction} @ {entry} | SL: {sl} | TP: {tps}"
+
+
+def _normalize_client_key(raw) -> Tuple:
+    """JSON 反序列化後 list 還原成 _client_signal_key 的 tuple。"""
+    return (
+        str(raw[0]),
+        str(raw[1]),
+        float(raw[2]),
+        bool(raw[3]),
+        float(raw[4]),
+        tuple(float(x) for x in (raw[5] or [])),
+    )
+
+
 class MT5ClientAgent:
-    def __init__(self, hub: HubClient, state_file: Path, mt5_files_dir: str = "", replay: bool = False):
+    def __init__(
+        self,
+        hub: HubClient,
+        state_file: Path,
+        mt5_files_dir: str = "",
+        replay: bool = False,
+        overrides: Optional[Dict[str, Any]] = None,
+    ):
         self.hub = hub
         self.state_file = state_file
         self.config = load_config()
         if mt5_files_dir:
             self.config.mt5_files_dir = mt5_files_dir
+
+        # 套用 web UI 上的下注設定覆寫（存在 web_launcher settings 內，不污染 config.json）
+        self._apply_overrides(overrides or {})
+
+        # 第二層保護：MT5 端持久化已下單訊號 key，避免同一筆 (來源,方向,進場,SL,TPs) 重複下單
+        self._processed_ttl = max(86400, int(getattr(self.config, "signal_dedup_minutes", 10) or 10) * 60)
+        self._processed_signals: Dict[Tuple, float] = {}
+
+        # 給 UI 看的事件 buffer（收到 Hub 訊號 / 跳過 / 送 MT5 / 失敗 等）
+        self.recent_events: Deque[Dict[str, Any]] = deque(maxlen=30)
 
         self.trade_manager = TradeManager(self.config.mt5_files_dir)
         self.trade_manager.default_lot_size = self.config.default_lot_size
@@ -113,9 +165,12 @@ class MT5ClientAgent:
         self.trade_manager.martingale_source_lots = getattr(self.config, "martingale_source_lots", {})
 
         self.state = _load_state(state_file)
+        self._restore_processed_signals()
         if replay:
             self.state["last_seq"] = 0
             self.state["hub_url"] = self.hub.hub_url
+            self._processed_signals.clear()
+            self.state["processed_signals"] = []
             _save_state(self.state_file, self.state)
         else:
             health = self.hub.health()
@@ -131,6 +186,78 @@ class MT5ClientAgent:
             self.state["hub_url"] = self.hub.hub_url
             _save_state(self.state_file, self.state)
 
+    def _restore_processed_signals(self) -> None:
+        """從 state 還原已下單訊號 key 集合，順便丟掉 TTL 過期的。"""
+        raw_list = self.state.get("processed_signals") or []
+        now = time.time()
+        for entry in raw_list:
+            try:
+                key = _normalize_client_key(entry.get("key") or [])
+                ts = float(entry.get("ts", 0))
+                if now - ts > self._processed_ttl:
+                    continue
+                self._processed_signals[key] = ts
+            except Exception:
+                continue
+        if self._processed_signals:
+            logger.info("已載入 %s 筆會員端下單去重紀錄", len(self._processed_signals))
+
+    def _persist_processed_signals(self) -> None:
+        self.state["processed_signals"] = [
+            {"key": list(k), "ts": ts} for k, ts in self._processed_signals.items()
+        ]
+        _save_state(self.state_file, self.state)
+
+    def _record_event(self, kind: str, **fields: Any) -> None:
+        """記錄一筆 UI 用事件（kind: signal_received | skipped_dedup | skipped_invalid | submitted | submit_failed）"""
+        self.recent_events.append({
+            "time": time.time(),
+            "kind": kind,
+            **fields,
+        })
+
+    def _apply_overrides(self, ov: Dict[str, Any]) -> None:
+        """把會員端 web UI 設定的下注參數覆蓋到 self.config（restart-time 一次性套用）。"""
+        def _f(name, cast):
+            raw = ov.get(name)
+            if raw in (None, "", "null"):
+                return
+            try:
+                setattr(self.config, name, cast(raw))
+            except (TypeError, ValueError):
+                logger.warning("override 失敗：%s=%r 無法 cast", name, raw)
+
+        def _flist(name):
+            raw = ov.get(name)
+            if not raw:
+                return
+            try:
+                if isinstance(raw, str):
+                    parts = [p.strip() for p in raw.replace("，", ",").split(",") if p.strip()]
+                    parsed = [float(p) for p in parts]
+                else:
+                    parsed = [float(x) for x in raw]
+                setattr(self.config, name, parsed)
+            except (TypeError, ValueError):
+                logger.warning("override list 失敗：%s=%r", name, raw)
+
+        def _fbool(name):
+            raw = ov.get(name)
+            if raw in (None, ""):
+                return
+            setattr(self.config, name, str(raw).strip().lower() in {"1", "true", "yes", "on", "啟用"})
+
+        _f("default_lot_size", float)
+        _fbool("use_martingale")
+        _f("martingale_multiplier", float)
+        _f("martingale_max_level", int)
+        _flist("martingale_lots")
+        _flist("partial_close_ratios")
+        _f("cancel_pending_after_seconds", int)
+        _f("cancel_if_price_beyond_percent", float)
+        _f("max_open_positions", int)
+        _f("signal_dedup_minutes", int)
+
     @property
     def last_seq(self) -> int:
         return int(self.state.get("last_seq") or 0)
@@ -142,6 +269,14 @@ class MT5ClientAgent:
 
     def run_cycle(self) -> int:
         count = 0
+        # TTL 清理（每輪都做一次，便宜）
+        now = time.time()
+        expired = [k for k, ts in self._processed_signals.items() if now - ts > self._processed_ttl]
+        if expired:
+            for k in expired:
+                self._processed_signals.pop(k, None)
+            self._persist_processed_signals()
+
         for item in self.hub.signals_after(self.last_seq):
             seq = int(item.get("seq") or 0)
             if item.get("type") != "trade_signal":
@@ -150,12 +285,25 @@ class MT5ClientAgent:
 
             payload = item.get("signal") or {}
             signal = _parsed_signal_from_payload(payload)
+            source = str(item.get("source") or item.get("source_name") or "central")
+            sig_summary = _signal_summary(signal)
+
+            self._record_event("signal_received", seq=seq, source=source, summary=sig_summary)
+
             if not _is_executable_signal(signal):
                 logger.warning("invalid hub signal seq=%s: incomplete signal payload=%s", seq, payload)
+                self._record_event("skipped_invalid", seq=seq, source=source, summary=sig_summary)
                 self._mark_seq(seq)
                 continue
 
-            source = str(item.get("source") or item.get("source_name") or "central")
+            # 第二層保護：本機 MT5 端去重 — 同一筆 (來源,方向,進場,SL,TPs) 不再下
+            signal_key = _client_signal_key(signal, source)
+            if signal_key in self._processed_signals:
+                logger.info("本機已下單過此訊號，跳過 seq=%s: %s", seq, signal)
+                self._record_event("skipped_dedup", seq=seq, source=source, summary=sig_summary)
+                self._mark_seq(seq)
+                continue
+
             signal_id = self.trade_manager.submit_signal(
                 signal,
                 auto_execute=True,
@@ -165,8 +313,19 @@ class MT5ClientAgent:
             )
             order = self.trade_manager.get_order_status(signal_id)
             if order is not None and order.status == OrderStatus.FAILED:
+                self._record_event("submit_failed", seq=seq, source=source, summary=sig_summary, signal_id=signal_id)
                 raise RuntimeError(f"failed to write MT5 command for hub seq={seq}")
+
+            self._processed_signals[signal_key] = time.time()
+            self._persist_processed_signals()
+
             logger.info("submitted hub seq=%s as local signal %s: %s", seq, signal_id, signal)
+            mt_lot = self.trade_manager.get_martingale_lot_size(source) if self.config.use_martingale else self.config.default_lot_size
+            self._record_event(
+                "submitted", seq=seq, source=source, summary=sig_summary,
+                signal_id=signal_id, lot_size=mt_lot,
+                martingale_level=(self.trade_manager.current_martingale_level if self.config.use_martingale else 0),
+            )
             self._mark_seq(seq)
             count += 1
         return count
