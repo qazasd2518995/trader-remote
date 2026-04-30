@@ -972,6 +972,10 @@ class WindowsClipboardControl(ClipboardControlBase):
                 logger.debug(f"clipboard copy all: focus failed for hwnd={window_id}")
                 return ""
 
+            # Seed a text-selection caret inside the chat pane. Without this,
+            # LINE CEF routes Ctrl+A to the sidebar/input box and selects nothing.
+            self._click_chat_area(window_id)
+
             # Keep LINE positioned at the latest messages before selecting all.
             self._send_input_keys([(self.VK_CONTROL, False, False)])
             ctrl_down = True

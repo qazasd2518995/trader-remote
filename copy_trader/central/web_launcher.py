@@ -10,11 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import queue
-import re
 import secrets
-import shutil
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -28,8 +25,6 @@ from typing import Any, Dict, Optional
 from copy_trader.config import DATA_DIR, load_config
 
 logger = logging.getLogger(__name__)
-
-_CLOUDFLARED_URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 
 
 def _truthy(value: Any) -> bool:
@@ -103,10 +98,7 @@ class LauncherState:
         self.lock = threading.Lock()
         self.worker: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
-        self.httpd = None
         self.client_agent = None
-        self.cloudflared_process: Optional[subprocess.Popen] = None
-        self.cloudflare_url = ""
         self.status = "尚未啟動"
         self.service_started_at: Optional[float] = None
         self.should_exit = False
@@ -115,13 +107,10 @@ class LauncherState:
     def defaults(self) -> Dict[str, Any]:
         if self.role == "central":
             return {
-                "host": "127.0.0.1",
-                "port": "8765",
+                "external_hub_url": "",
                 "token": secrets.token_urlsafe(24),
                 "copy_mode": "all",
                 "interval": "1.0",
-                "cloudflare_tunnel": "true",
-                "cloudflared_path": "",
             }
         return {
             "hub_url": "http://中央電腦IP:8765",
@@ -166,110 +155,11 @@ class LauncherState:
 
     def stop_service(self) -> None:
         self.stop_event.set()
-        if self.httpd is not None:
-            try:
-                self.httpd.shutdown()
-            except Exception:
-                pass
-        self._stop_cloudflare_tunnel()
         self.status = "停止中"
 
-    def _cloudflared_candidates(self) -> list[Path]:
-        exe_name = "cloudflared.exe" if sys.platform == "win32" else "cloudflared"
-        configured = str(self.settings.get("cloudflared_path") or "").strip().strip('"')
-        candidates = []
-        if configured:
-            candidates.append(Path(configured))
-
-        candidates.append(DATA_DIR / exe_name)
-        candidates.append(Path(sys.executable).with_name(exe_name))
-        candidates.append(Path.cwd() / exe_name)
-
-        found = shutil.which("cloudflared") or shutil.which("cloudflared.exe")
-        if found:
-            candidates.append(Path(found))
-
-        return candidates
-
-    def _find_cloudflared(self) -> Optional[Path]:
-        for path in self._cloudflared_candidates():
-            try:
-                if path.is_file():
-                    return path
-            except OSError:
-                continue
-        return None
-
-    def _start_cloudflare_tunnel(self, port: int) -> None:
-        if not _truthy(self.settings.get("cloudflare_tunnel")):
-            self.cloudflare_url = ""
-            return
-
-        exe = self._find_cloudflared()
-        if exe is None:
-            logger.warning("找不到 cloudflared，Cloudflare Tunnel 未啟動")
-            logger.warning("Windows 請先執行同資料夾的 install_cloudflared_windows.bat，或安裝 Cloudflare cloudflared")
-            return
-
-        target = f"http://127.0.0.1:{port}"
-        cmd = [str(exe), "tunnel", "--url", target]
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-        self.cloudflare_url = ""
-        logger.info("Cloudflare Quick Tunnel 啟動中：%s", target)
-        self.cloudflared_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=creationflags,
-        )
-        threading.Thread(target=self._read_cloudflared_logs, daemon=True).start()
-
-    def _read_cloudflared_logs(self) -> None:
-        process = self.cloudflared_process
-        if process is None or process.stdout is None:
-            return
-
-        try:
-            for line in process.stdout:
-                text = line.strip()
-                if not text:
-                    continue
-                match = _CLOUDFLARED_URL_RE.search(text)
-                if match:
-                    self.cloudflare_url = match.group(0)
-                    logger.info("Cloudflare 公開 Hub URL：%s", self.cloudflare_url)
-                    logger.info("會員端請填 Hub URL：%s", self.cloudflare_url)
-                elif "error" in text.lower() or "failed" in text.lower():
-                    logger.warning("cloudflared: %s", text)
-        except Exception as exc:
-            logger.warning("讀取 cloudflared 紀錄失敗：%s", exc)
-        finally:
-            if process.poll() is not None and not self.stop_event.is_set():
-                logger.warning("Cloudflare Tunnel 已停止，exit_code=%s", process.returncode)
-
-    def _stop_cloudflare_tunnel(self) -> None:
-        process = self.cloudflared_process
-        self.cloudflared_process = None
-        self.cloudflare_url = ""
-        if process is None or process.poll() is not None:
-            return
-        try:
-            process.terminate()
-            process.wait(timeout=5)
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
-
     def _run_central(self) -> None:
-        # Central hub mode is hosted in the cloud and not bundled in the member client build.
+        # Central signal-collection mode lives on the cloud Hub side and is not
+        # bundled in the member client build.
         logger.error("中央訊號中心模式未啟用：本程式為會員端獨立版本。")
         self.status = "中央模式不支援"
 
@@ -348,7 +238,6 @@ class LauncherState:
             "running": self.is_running(),
             "logs": self.logs[-200:],
             "lan_ip": _lan_ip(),
-            "cloudflare_url": self.cloudflare_url,
             "uptime_seconds": int(time.time() - self.service_started_at) if self.service_started_at else 0,
         }
 
@@ -438,20 +327,17 @@ def make_handler(state: LauncherState):
 def _page_html(state: LauncherState) -> str:
     is_central = state.role == "central"
     fields = """
-      <label>Hub 監聽 IP<input id="host" /></label>
-      <label>Hub Port<input id="port" /></label>
+      <label>雲端 Hub URL<input id="external_hub_url" placeholder="例如 https://gold-signal-hub-tw.fly.dev" /></label>
       <label>Hub 密碼<input id="token" type="password" /></label>
       <label>複製模式<select id="copy_mode"><option value="all">全選複製</option><option value="tail">底部幾屏</option></select></label>
       <label>輪詢秒數<input id="interval" /></label>
-      <label>Cloudflare Tunnel<input id="cloudflare_tunnel" type="checkbox" /></label>
-      <label>cloudflared 路徑<input id="cloudflared_path" placeholder="可留空自動搜尋" /></label>
     """ if is_central else """
       <label>中央 Hub URL<input id="hub_url" placeholder="http://中央電腦IP:8765" /></label>
       <label>Hub 密碼<input id="token" type="password" /></label>
       <label>MT5 Files 路徑<input id="mt5_files_dir" placeholder="可留空自動偵測" /></label>
       <label>輪詢秒數<input id="interval" /></label>
     """
-    extra_button = "<button id=\"openHub\">開啟 Hub 頁面</button>" if is_central else "<button id=\"testHub\">測試 Hub</button>"
+    extra_button = "" if is_central else "<button id=\"testHub\">測試 Hub</button>"
     return f"""<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -494,7 +380,7 @@ def _page_html(state: LauncherState) -> str:
     const role = {json.dumps(state.role)};
     let snapshot = null;
     let didFill = false;
-    function ids() {{ return role === "central" ? ["host","port","token","copy_mode","interval","cloudflare_tunnel","cloudflared_path"] : ["hub_url","token","mt5_files_dir","interval"]; }}
+    function ids() {{ return role === "central" ? ["external_hub_url","token","copy_mode","interval"] : ["hub_url","token","mt5_files_dir","interval"]; }}
     function collect() {{
       const out = {{}};
       for (const id of ids()) {{
@@ -528,14 +414,10 @@ def _page_html(state: LauncherState) -> str:
       document.getElementById("logs").textContent = (snapshot.logs || []).join("\\n");
       document.getElementById("logs").scrollTop = document.getElementById("logs").scrollHeight;
       if (role === "central") {{
-        const port = snapshot.settings.port || "8765";
-        if (snapshot.cloudflare_url) {{
-          document.getElementById("hint").textContent = `會員端 Hub URL：${{snapshot.cloudflare_url}}`;
-        }} else if (["true", "1", "yes", "on"].includes(String(snapshot.settings.cloudflare_tunnel || "").toLowerCase())) {{
-          document.getElementById("hint").textContent = "Cloudflare Tunnel 啟動中；公開 Hub URL 會出現在狀態紀錄。";
-        }} else {{
-          document.getElementById("hint").textContent = `會員端 Hub URL 可填：http://${{snapshot.lan_ip}}:${{port}}`;
-        }}
+        const url = snapshot.settings.external_hub_url || "";
+        document.getElementById("hint").textContent = url
+          ? `會員端 Hub URL 填：${{url}}`
+          : "請填入雲端 Hub URL 後再按開始";
       }}
     }}
     document.getElementById("start").onclick = () => post("/api/start", collect()).then(refresh).catch(e => alert(e.message));
@@ -556,7 +438,7 @@ def _page_html(state: LauncherState) -> str:
 def _install_logging(state: LauncherState) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     handler = QueueLogHandler(state.log_queue)
-    handler.setFormatter(logging.Formatter("%H:%M:%S %(levelname)s: %(message)s"))
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S"))
     logging.getLogger().addHandler(handler)
 
 
