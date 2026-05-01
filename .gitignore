@@ -26,3 +26,6 @@ desktop.ini
 config.json
 *_web_launcher_settings.json
 central_client_state.json
+central_processed.json
+central_hub_signals.jsonl
+martingale_state.json

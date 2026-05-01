@@ -172,8 +172,8 @@ class Config:
     log_level: str = "INFO"
     log_file: str = "copy_trader.log"
 
-    # AI parser keys are not used by the member client build; left as
-    # configurable defaults for compatibility with shared config.py loading.
+    # AI parser keys are not bundled in either central or client build (the spec
+    # excludes groq / anthropic / google.genai). Set via env or config.json if needed.
     _GROQ_API_KEY = ""
     _GEMINI_API_KEY = ""
 

@@ -170,10 +170,56 @@ class LauncherState:
         self.status = "停止中"
 
     def _run_central(self) -> None:
-        # Central signal-collection mode lives on the cloud Hub side and is not
-        # bundled in the member client build.
-        logger.error("中央訊號中心模式未啟用：本程式為會員端獨立版本。")
-        self.status = "中央模式不支援"
+        try:
+            from copy_trader.central.signal_collector import CentralSignalCollector, HubPublisher
+
+            external_hub_url = str(self.settings.get("external_hub_url") or "").strip().rstrip("/")
+            if not external_hub_url:
+                logger.error("未設定外部 Hub URL；本程式為雲端模式，請填入雲端 Hub 網址後再開始")
+                self.status = "啟動失敗"
+                return
+
+            token = str(self.settings.get("token") or "")
+            interval = max(0.2, float(self.settings.get("interval") or 1.0))
+            copy_mode = str(self.settings.get("copy_mode") or "all")
+
+            logger.info("雲端 Hub 模式：訊號將推送到 %s", external_hub_url)
+            publisher = HubPublisher(external_hub_url, token)
+
+            collector = CentralSignalCollector(load_config(), publisher, copy_mode=copy_mode)
+            self.collector = collector
+            self.status = "運行中"
+            self.service_started_at = time.time()
+
+            consecutive_errors = 0
+            transient_quiet_threshold = 5
+
+            while not self.stop_event.is_set():
+                try:
+                    published = collector.run_cycle()
+                    if published:
+                        logger.info("本輪發布 %s 筆訊號", published)
+                    if consecutive_errors:
+                        if consecutive_errors > transient_quiet_threshold:
+                            logger.info("雲端 Hub 連線恢復（之前連續斷線 %s 次）", consecutive_errors)
+                        consecutive_errors = 0
+                except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
+                    consecutive_errors += 1
+                    if _is_transient_disconnect(exc) and consecutive_errors <= transient_quiet_threshold:
+                        logger.debug("發布到雲端 Hub 短暫斷線（第 %s 次），自動重試中：%s", consecutive_errors, exc)
+                    else:
+                        logger.warning("發布到雲端 Hub 失敗（連續 %s 次）：%s", consecutive_errors, exc)
+                except Exception as exc:
+                    consecutive_errors += 1
+                    logger.exception("中央擷取錯誤：%s", exc)
+                self.stop_event.wait(interval)
+        except Exception as exc:
+            logger.exception("中央訊號中心啟動失敗：%s", exc)
+            self.status = "啟動失敗"
+        finally:
+            self.collector = None
+            self.status = "已停止"
+            self.service_started_at = None
 
     def _run_client(self) -> None:
         try:
