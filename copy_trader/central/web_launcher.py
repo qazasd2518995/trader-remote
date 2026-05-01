@@ -116,6 +116,7 @@ class LauncherState:
         return {
             "hub_url": "http://中央電腦IP:8765",
             "token": "",
+            "member_name": "",  # 會員顯示名稱（給訊號中心管理面板看）
             "mt5_files_dir": "",
             "interval": "1.0",
             # 下單參數（覆寫 config.py 預設）
@@ -129,6 +130,9 @@ class LauncherState:
             "cancel_if_price_beyond_percent": "1.0",
             "signal_dedup_minutes": "10",
             "max_open_positions": "10",
+            # 來源過濾（多筆以逗號分隔，留空 = 不過濾）
+            "source_whitelist": "",
+            "source_blacklist": "",
         }
 
     def _load_settings(self) -> Dict[str, Any]:
@@ -151,6 +155,12 @@ class LauncherState:
             json.dump(merged, f, ensure_ascii=False, indent=2)
         self.settings = merged
         logger.info("設定已儲存：%s", self.settings_path)
+        # 熱套用：服務運行中且為 client 模式時，把新設定即時推到 agent 不必重啟
+        if self.role == "client" and self.client_agent is not None:
+            try:
+                self.client_agent.apply_overrides_live(merged)
+            except Exception as exc:
+                logger.warning("熱套用設定失敗：%s", exc)
         return merged
 
     def is_running(self) -> bool:
@@ -238,7 +248,11 @@ class LauncherState:
                 overrides=self.settings,
             )
             self.client_agent.trade_manager.start()
-            logger.info("會員端已啟動，Hub=%s，last_seq=%s", hub_url, self.client_agent.last_seq)
+            self.client_agent._safe_register()
+            logger.info(
+                "會員端已啟動，Hub=%s，client_id=%s，last_seq=%s",
+                hub_url, self.client_agent.client_id, self.client_agent.last_seq,
+            )
             self.status = "運行中"
             self.service_started_at = time.time()
 
@@ -307,6 +321,11 @@ class LauncherState:
             snap["orders"] = _orders_for_ui(self.client_agent.trade_manager)
             snap["martingale_level"] = self.client_agent.trade_manager.current_martingale_level
             snap["martingale_enabled"] = bool(self.client_agent.config.use_martingale)
+            snap["paused"] = bool(self.client_agent.paused)
+            snap["active_positions"] = self.client_agent.trade_manager.active_position_count()
+            snap["max_open_positions"] = int(getattr(self.client_agent.config, "max_open_positions", 0) or 0)
+            snap["client_id"] = self.client_agent.client_id
+            snap["member_name"] = self.client_agent._display_name()
         return snap
 
 
@@ -411,6 +430,29 @@ def make_handler(state: LauncherState):
                     _json_response(self, 200, {"ok": True})
                     threading.Thread(target=state.control_server.shutdown, daemon=True).start()
                     return
+                if parsed.path == "/api/pause":
+                    if state.client_agent is None:
+                        _json_response(self, 400, {"ok": False, "error": "agent_not_running"})
+                        return
+                    data = _read_json(self)
+                    paused = bool(data.get("paused", True))
+                    state.client_agent.set_paused(paused)
+                    _json_response(self, 200, {"ok": True, "paused": paused})
+                    return
+                if parsed.path == "/api/close-all":
+                    if state.client_agent is None:
+                        _json_response(self, 400, {"ok": False, "error": "agent_not_running"})
+                        return
+                    result = state.client_agent.close_all(reason="ui_close_all")
+                    _json_response(self, 200, {"ok": True, "result": result})
+                    return
+                if parsed.path == "/api/reset-martingale":
+                    if state.client_agent is None:
+                        _json_response(self, 400, {"ok": False, "error": "agent_not_running"})
+                        return
+                    state.client_agent.reset_martingale()
+                    _json_response(self, 200, {"ok": True})
+                    return
             except Exception as exc:
                 logger.exception("request failed: %s", exc)
                 _json_response(self, 500, {"ok": False, "error": str(exc)})
@@ -420,294 +462,1021 @@ def make_handler(state: LauncherState):
     return Handler
 
 
+_LAUNCHER_CSS = """
+:root {
+  --bg: #0a0e14;
+  --bg-elev: #0f141b;
+  --bg-card: #131a22;
+  --bg-soft: #181f28;
+  --bg-input: #0c1117;
+  --border: #1f2832;
+  --border-strong: #2b3744;
+  --border-input: #2a3441;
+  --text: #e6edf3;
+  --text-dim: #8b96a3;
+  --text-faint: #4d5864;
+  --gold: #d4a24c;
+  --gold-bright: #e8b964;
+  --gold-soft: rgba(212, 162, 76, 0.10);
+  --gold-line: rgba(212, 162, 76, 0.30);
+  --green: #4ade80;
+  --green-soft: rgba(74, 222, 128, 0.13);
+  --green-line: rgba(74, 222, 128, 0.32);
+  --red: #ef4444;
+  --red-soft: rgba(239, 68, 68, 0.13);
+  --red-line: rgba(239, 68, 68, 0.32);
+  --amber: #f5b041;
+  --amber-soft: rgba(245, 176, 65, 0.14);
+  --amber-line: rgba(245, 176, 65, 0.32);
+  --blue: #6ea8ff;
+  --blue-soft: rgba(110, 168, 255, 0.13);
+  --font-display: 'Fraunces', 'Noto Serif TC', 'Iowan Old Style', Georgia, serif;
+  --font-mono: 'JetBrains Mono', 'Noto Sans TC', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px; line-height: 1.5;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  min-height: 100vh;
+}
+body::before {
+  content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 200;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.55'/%3E%3C/svg%3E");
+  opacity: 0.03; mix-blend-mode: overlay;
+}
+body::after {
+  content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 199;
+  background: repeating-linear-gradient(180deg, transparent 0 2px, rgba(255,255,255,0.012) 2px 3px);
+}
+/* ---------- topbar ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  background: rgba(10,14,20,0.85);
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  border-bottom: 1px solid var(--border);
+  padding: 13px 26px;
+  display: grid; grid-template-columns: auto 1fr auto;
+  gap: 24px; align-items: center;
+}
+.brand { display: flex; align-items: baseline; gap: 14px; min-width: 0; }
+.brand-mark {
+  font-family: var(--font-display);
+  font-size: 24px; font-weight: 400; font-style: italic;
+  letter-spacing: -0.025em; color: var(--gold); line-height: 1;
+}
+.brand-mark::after {
+  content: ''; display: inline-block; width: 6px; height: 6px;
+  background: var(--gold); margin-left: 6px; vertical-align: middle;
+  transform: translateY(-3px);
+}
+.brand-meta {
+  font-size: 9px; letter-spacing: 0.22em;
+  color: var(--text-faint); text-transform: uppercase;
+}
+.role-tag {
+  display: inline-block; margin-left: 8px;
+  padding: 3px 8px; font-size: 9px;
+  letter-spacing: 0.22em; text-transform: uppercase;
+  color: var(--gold); border: 1px solid var(--gold-line);
+  background: var(--gold-soft);
+}
+.title-display {
+  font-family: var(--font-display);
+  font-style: italic; font-size: 14px;
+  color: var(--text-dim); letter-spacing: -0.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.topbar-status { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: flex-end; }
+.live-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 5px 11px; border: 1px solid var(--border-strong);
+  font-size: 9px; letter-spacing: 0.22em;
+  text-transform: uppercase; color: var(--text-dim);
+  background: var(--bg-card);
+}
+.live-pill.running { border-color: var(--green-line); color: var(--green); }
+.live-pill.warn { border-color: var(--amber-line); color: var(--amber); }
+.live-pill.err { border-color: var(--red-line); color: var(--red); }
+.live-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-faint);
+}
+.live-pill.running .live-dot {
+  background: var(--green); box-shadow: 0 0 9px var(--green);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.live-pill.warn .live-dot {
+  background: var(--amber); box-shadow: 0 0 9px var(--amber);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.live-pill.err .live-dot {
+  background: var(--red); box-shadow: 0 0 9px var(--red);
+  animation: pulse 0.7s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.3; transform: scale(0.6); }
+}
+.meta-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 11px; border: 1px solid var(--border);
+  font-size: 10px; letter-spacing: 0.06em; color: var(--text-dim);
+  font-variant-numeric: tabular-nums; background: var(--bg-card);
+}
+.meta-pill .lbl {
+  font-size: 9px; letter-spacing: 0.22em; text-transform: uppercase;
+  color: var(--text-faint);
+}
+.clock {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim); font-size: 12px;
+  letter-spacing: 0.04em;
+}
+/* ---------- main grid ---------- */
+main {
+  padding: 22px 26px 26px;
+  display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  gap: 18px; max-width: 1640px; margin: 0 auto;
+  align-items: start;
+}
+@media (max-width: 1100px) {
+  main { grid-template-columns: 1fr; padding: 16px; }
+  .topbar { grid-template-columns: 1fr auto; }
+  .topbar .topbar-status { grid-column: 1 / -1; justify-content: flex-start; }
+}
+.col { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+/* ---------- panel ---------- */
+.panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  position: relative;
+}
+.panel::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent, var(--gold-line), transparent);
+  opacity: 0.55;
+}
+.panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; border-bottom: 1px solid var(--border); gap: 12px;
+}
+.panel-title {
+  font-family: var(--font-display); font-size: 18px;
+  font-weight: 400; font-style: italic;
+  letter-spacing: -0.015em; color: var(--text);
+}
+.panel-title-tag {
+  display: inline-block; margin-left: 8px;
+  font-family: var(--font-mono); font-style: normal;
+  font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--gold); padding: 2px 6px; border: 1px solid var(--gold-line);
+  vertical-align: middle;
+}
+.panel-meta {
+  font-size: 10px; color: var(--text-faint);
+  letter-spacing: 0.18em; text-transform: uppercase;
+}
+.panel-body { padding: 18px; }
+.panel-body.compact { padding: 4px 0; }
+/* ---------- form ---------- */
+.group {
+  border-bottom: 1px solid var(--border);
+  padding: 14px 18px 18px;
+}
+.group:last-child { border-bottom: none; }
+.group-head {
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px;
+}
+.group-num {
+  font-size: 9px; letter-spacing: 0.22em; color: var(--gold);
+}
+.group-title {
+  font-family: var(--font-display);
+  font-style: italic; font-size: 15px;
+  color: var(--text); letter-spacing: -0.01em;
+}
+.group-hint {
+  font-size: 10px; letter-spacing: 0.04em;
+  color: var(--text-faint); margin-left: auto;
+}
+.field {
+  display: grid; grid-template-columns: 160px 1fr;
+  align-items: center; gap: 14px;
+  padding: 7px 0; border-bottom: 1px dashed var(--border);
+}
+.field:last-child { border-bottom: none; }
+.field-label {
+  font-size: 10px; letter-spacing: 0.18em;
+  text-transform: uppercase; color: var(--text-dim);
+}
+.field-control { min-width: 0; }
+input[type="text"], input:not([type]), input[type="password"], select {
+  width: 100%; font: inherit; font-size: 12px;
+  padding: 8px 10px; background: var(--bg-input);
+  color: var(--text); border: 1px solid var(--border-input);
+  border-radius: 0; outline: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+input[type="text"]:focus, input:not([type]):focus, input[type="password"]:focus, select:focus {
+  border-color: var(--gold); background: var(--bg-soft);
+}
+input::placeholder { color: var(--text-faint); }
+select { appearance: none; background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%238b96a3' d='M0 0l5 6 5-6z'/></svg>"); background-repeat: no-repeat; background-position: right 12px center; padding-right: 30px; }
+/* checkbox as toggle */
+.toggle { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+.toggle input { display: none; }
+.toggle-track {
+  width: 36px; height: 18px; background: var(--bg-input);
+  border: 1px solid var(--border-input);
+  position: relative; transition: background 0.15s ease, border-color 0.15s ease;
+}
+.toggle-thumb {
+  position: absolute; top: 1px; left: 1px;
+  width: 14px; height: 14px; background: var(--text-faint);
+  transition: transform 0.18s ease, background 0.18s ease;
+}
+.toggle input:checked + .toggle-track { background: var(--gold-soft); border-color: var(--gold); }
+.toggle input:checked + .toggle-track .toggle-thumb { transform: translateX(18px); background: var(--gold); }
+.toggle-label { font-size: 11px; color: var(--text-dim); letter-spacing: 0.06em; }
+/* ---------- buttons ---------- */
+.button-row {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  padding: 14px 18px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+}
+.button-row.runtime {
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+}
+button.btn {
+  font: inherit; font-family: var(--font-mono);
+  font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase;
+  padding: 8px 14px; background: transparent;
+  color: var(--text-dim); border: 1px solid var(--border-strong);
+  cursor: pointer; transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+button.btn:hover { color: var(--text); border-color: var(--text-faint); background: var(--bg-soft); }
+button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+button.btn.primary {
+  background: var(--gold); color: #0a0e14; border-color: var(--gold);
+  font-weight: 600;
+}
+button.btn.primary:hover { background: var(--gold-bright); border-color: var(--gold-bright); color: #0a0e14; }
+button.btn.danger { color: var(--red); border-color: var(--red-line); }
+button.btn.danger:hover { background: var(--red-soft); color: var(--red); }
+button.btn.warn { color: var(--amber); border-color: var(--amber-line); }
+button.btn.warn:hover { background: var(--amber-soft); color: var(--amber); }
+.button-glyph {
+  display: inline-block; width: 6px; height: 6px;
+  background: currentColor;
+}
+button.btn.primary .button-glyph { background: #0a0e14; }
+.hint-row {
+  padding: 10px 18px; font-size: 11px; color: var(--text-faint);
+  letter-spacing: 0.04em; border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.hint-row.gold { color: var(--gold); background: var(--gold-soft); border-bottom: 1px solid var(--gold-line); }
+/* ---------- logs ---------- */
+.logs {
+  height: 300px; overflow: auto; white-space: pre-wrap;
+  background: #06090d; color: #b8d4c4;
+  padding: 14px 16px; font-family: var(--font-mono); font-size: 11.5px;
+  line-height: 1.55; border-top: 1px solid var(--border);
+  position: relative;
+}
+.logs::before {
+  content: '$ tail -f service.log'; display: block;
+  color: var(--gold); font-size: 10px; letter-spacing: 0.16em;
+  text-transform: uppercase; margin-bottom: 8px; opacity: 0.7;
+}
+/* ---------- right panel: captures (central) ---------- */
+.capture-card {
+  border-bottom: 1px solid var(--border);
+  padding: 14px 18px;
+  transition: background 0.12s ease;
+}
+.capture-card:hover { background: var(--bg-soft); }
+.capture-meta {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 10px; margin-bottom: 8px; flex-wrap: wrap;
+}
+.capture-source {
+  font-size: 11px; color: var(--gold);
+  letter-spacing: 0.04em; font-weight: 500;
+}
+.capture-stamp {
+  font-size: 10px; color: var(--text-faint);
+  letter-spacing: 0.06em; font-variant-numeric: tabular-nums;
+}
+.capture-status {
+  font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
+  padding: 1px 7px; border: 1px solid;
+}
+.capture-status.ok { color: var(--green); border-color: var(--green-line); background: var(--green-soft); }
+.capture-status.bad { color: var(--red); border-color: var(--red-line); background: var(--red-soft); }
+.capture-text {
+  font-size: 11px; color: var(--text-dim);
+  background: var(--bg-input); padding: 10px 12px;
+  border-left: 2px solid var(--border-strong);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 180px; overflow: auto;
+  font-variant-numeric: tabular-nums;
+}
+.capture-msgs { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.capture-msg {
+  font-size: 11px; padding: 8px 10px;
+  background: var(--bg-soft); border-left: 2px solid var(--gold);
+  white-space: pre-wrap; word-break: break-word;
+  color: var(--text);
+}
+.capture-msg-meta {
+  font-size: 9px; color: var(--text-faint);
+  letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 4px;
+}
+/* ---------- right panel: martingale strip (client) ---------- */
+.mg-strip {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 1px; background: var(--border); margin: 0;
+}
+.mg-cell {
+  background: var(--bg-card); padding: 14px 18px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.mg-label {
+  font-size: 9px; letter-spacing: 0.22em; text-transform: uppercase;
+  color: var(--text-faint);
+}
+.mg-value {
+  font-size: 18px; color: var(--text);
+  font-variant-numeric: tabular-nums; letter-spacing: -0.01em;
+}
+.mg-value.gold { color: var(--gold-bright); }
+.mg-value.green { color: var(--green); }
+.mg-value.red { color: var(--red); }
+.mg-value.amber { color: var(--amber); }
+.mg-value.dim { color: var(--text-dim); font-size: 14px; }
+.mg-sub {
+  font-size: 10px; color: var(--text-dim);
+  letter-spacing: 0.06em;
+}
+/* ---------- right panel: events (client) ---------- */
+.events { max-height: 360px; overflow-y: auto; }
+.event {
+  display: grid; grid-template-columns: 70px 100px 1fr;
+  gap: 12px; padding: 9px 18px; align-items: baseline;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+}
+.event:last-child { border-bottom: none; }
+.event:hover { background: var(--bg-soft); }
+.event-time {
+  color: var(--text-faint); font-size: 10px;
+  font-variant-numeric: tabular-nums; letter-spacing: 0.04em;
+}
+.event-kind {
+  font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase;
+  padding: 2px 7px; text-align: center;
+  font-weight: 500;
+}
+.event-kind.signal_received { background: var(--blue-soft); color: var(--blue); }
+.event-kind.submitted { background: var(--green-soft); color: var(--green); }
+.event-kind.skipped_dedup, .event-kind.skipped_invalid { background: var(--amber-soft); color: var(--amber); }
+.event-kind.submit_failed { background: var(--red-soft); color: var(--red); }
+.event-kind.unknown { background: transparent; color: var(--text-faint); border: 1px solid var(--border); }
+.event-summary {
+  color: var(--text); font-size: 11.5px; word-break: break-word;
+  font-variant-numeric: tabular-nums;
+}
+.event-extra {
+  color: var(--text-faint); font-size: 10px;
+  letter-spacing: 0.04em; margin-top: 2px;
+}
+/* ---------- right panel: orders (client) ---------- */
+.orders { max-height: 380px; overflow-y: auto; }
+.order {
+  display: grid; grid-template-columns: 70px 84px 1fr auto;
+  gap: 12px; padding: 11px 18px; align-items: center;
+  border-bottom: 1px solid var(--border);
+}
+.order:last-child { border-bottom: none; }
+.order:hover { background: var(--bg-soft); }
+.order-time {
+  font-size: 10px; color: var(--text-faint);
+  font-variant-numeric: tabular-nums; letter-spacing: 0.04em;
+}
+.order-status-tag {
+  font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase;
+  padding: 3px 7px; text-align: center; font-weight: 500;
+}
+.order-status-tag.pending { background: var(--amber-soft); color: var(--amber); }
+.order-status-tag.sent { background: var(--blue-soft); color: var(--blue); }
+.order-status-tag.filled { background: var(--green-soft); color: var(--green); }
+.order-status-tag.partial { background: var(--green-soft); color: var(--green); }
+.order-status-tag.closed { background: var(--bg-input); color: var(--text-dim); border: 1px solid var(--border); }
+.order-status-tag.cancelled { background: var(--bg-input); color: var(--text-faint); border: 1px solid var(--border); }
+.order-status-tag.failed { background: var(--red-soft); color: var(--red); }
+.order-main {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-variant-numeric: tabular-nums;
+}
+.order-dir {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.16em;
+  padding: 1px 6px;
+}
+.order-dir.buy { color: var(--green); background: var(--green-soft); }
+.order-dir.sell { color: var(--red); background: var(--red-soft); }
+.order-price { font-size: 12px; color: var(--text); }
+.order-meta {
+  display: block; font-size: 10px; color: var(--text-faint);
+  margin-top: 3px; letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  width: 100%;
+}
+.order-lot {
+  font-size: 11px; color: var(--gold);
+  font-variant-numeric: tabular-nums; letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+/* ---------- empty state ---------- */
+.empty-state {
+  padding: 32px 18px; text-align: center;
+  color: var(--text-faint); font-size: 10px;
+  letter-spacing: 0.22em; text-transform: uppercase;
+}
+/* scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); }
+::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+"""
+
+
+def _field(label: str, control_html: str) -> str:
+    return (
+        '<div class="field">'
+        f'<label class="field-label">{label}</label>'
+        f'<div class="field-control">{control_html}</div>'
+        '</div>'
+    )
+
+
+def _input(field_id: str, placeholder: str = "", input_type: str = "text") -> str:
+    pl = f' placeholder="{placeholder}"' if placeholder else ""
+    return f'<input id="{field_id}" type="{input_type}"{pl} />'
+
+
+def _select(field_id: str, options: list) -> str:
+    opts = "".join(f'<option value="{v}">{label}</option>' for v, label in options)
+    return f'<select id="{field_id}">{opts}</select>'
+
+
+def _toggle(field_id: str, label_text: str = "啟用") -> str:
+    return (
+        '<label class="toggle">'
+        f'<input id="{field_id}" type="checkbox" />'
+        '<span class="toggle-track"><span class="toggle-thumb"></span></span>'
+        f'<span class="toggle-label">{label_text}</span>'
+        '</label>'
+    )
+
+
+def _central_settings_html() -> str:
+    inner = (
+        '<div class="group">'
+        '<div class="group-head">'
+        '<span class="group-num">01 ·</span>'
+        '<span class="group-title">Cloud Hub</span>'
+        '<span class="group-hint">將擷取到的訊號推送至雲端</span>'
+        '</div>'
+        + _field("Hub URL", _input("external_hub_url", "https://gold-signal-hub-tw.fly.dev"))
+        + _field("Hub 密碼", _input("token", input_type="password"))
+        + _field("複製模式", _select("copy_mode", [("all", "全選複製"), ("tail", "底部幾屏")]))
+        + _field("輪詢秒數", _input("interval", "1.0"))
+        + '</div>'
+    )
+    return inner
+
+
+def _client_settings_html() -> str:
+    groups = []
+    # group 1 — connection
+    groups.append(
+        '<div class="group">'
+        '<div class="group-head">'
+        '<span class="group-num">01 ·</span>'
+        '<span class="group-title">Connection</span>'
+        '<span class="group-hint">與訊號中心 Hub 連線</span>'
+        '</div>'
+        + _field("Hub URL", _input("hub_url", "http://中央電腦IP:8765"))
+        + _field("Hub 密碼", _input("token", input_type="password"))
+        + _field("會員顯示名稱", _input("member_name", "留空 = 自動產生"))
+        + _field("MT5 Files 路徑", _input("mt5_files_dir", "可留空自動偵測"))
+        + _field("輪詢秒數", _input("interval", "1.0"))
+        + '</div>'
+    )
+    # group 2 — orders
+    groups.append(
+        '<div class="group">'
+        '<div class="group-head">'
+        '<span class="group-num">02 ·</span>'
+        '<span class="group-title">Order Sizing</span>'
+        '<span class="group-hint">手數 / 馬丁加碼 / 分批 TP</span>'
+        '</div>'
+        + _field("預設手數", _input("default_lot_size", "0.01"))
+        + _field("啟用馬丁", _toggle("use_martingale", "Martingale"))
+        + _field("馬丁倍數", _input("martingale_multiplier", "2.0"))
+        + _field("馬丁最大層級", _input("martingale_max_level", "4"))
+        + _field("自訂每層手數", _input("martingale_lots", "例 0.01,0.02,0.04,0.08"))
+        + _field("分批 TP 比例", _input("partial_close_ratios", "0.5,0.3,0.2"))
+        + '</div>'
+    )
+    # group 3 — risk
+    groups.append(
+        '<div class="group">'
+        '<div class="group-head">'
+        '<span class="group-num">03 ·</span>'
+        '<span class="group-title">Risk Control</span>'
+        '<span class="group-hint">掛單時效 / 去重 / 持倉上限</span>'
+        '</div>'
+        + _field("掛單取消秒數", _input("cancel_pending_after_seconds", "7200"))
+        + _field("取消偏離 %", _input("cancel_if_price_beyond_percent", "1.0"))
+        + _field("訊號 dedup 分鐘", _input("signal_dedup_minutes", "10"))
+        + _field("最大同時持倉", _input("max_open_positions", "10"))
+        + '</div>'
+    )
+    # group 4 — source filters
+    groups.append(
+        '<div class="group">'
+        '<div class="group-head">'
+        '<span class="group-num">04 ·</span>'
+        '<span class="group-title">Source Filter</span>'
+        '<span class="group-hint">逗號分隔，留空 = 不過濾</span>'
+        '</div>'
+        + _field("白名單來源", _input("source_whitelist"))
+        + _field("黑名單來源", _input("source_blacklist"))
+        + '</div>'
+    )
+    return "".join(groups)
+
+
+def _central_right_panel() -> str:
+    return (
+        '<div class="panel">'
+        '<div class="panel-header">'
+        '<span class="panel-title">Capture Stream<span class="panel-title-tag">LINE</span></span>'
+        '<span class="panel-meta" id="capture-summary">—</span>'
+        '</div>'
+        '<div class="panel-body compact">'
+        '<div id="captures"><div class="empty-state">服務啟動後此處會出現複製內容</div></div>'
+        '</div>'
+        '</div>'
+    )
+
+
+def _client_right_panel() -> str:
+    return (
+        # martingale + position strip
+        '<div class="panel">'
+        '<div class="panel-header">'
+        '<span class="panel-title">Runtime Telemetry</span>'
+        '<span class="panel-meta" id="telemetry-meta">—</span>'
+        '</div>'
+        '<div class="mg-strip" id="mg-strip">'
+        '<div class="mg-cell"><span class="mg-label">Status</span><span class="mg-value dim" id="mg-status">—</span></div>'
+        '<div class="mg-cell"><span class="mg-label">Martingale</span><span class="mg-value gold" id="mg-level">—</span><span class="mg-sub" id="mg-mode">—</span></div>'
+        '<div class="mg-cell"><span class="mg-label">Open Positions</span><span class="mg-value" id="mg-positions">—</span><span class="mg-sub" id="mg-positions-cap">—</span></div>'
+        '<div class="mg-cell"><span class="mg-label">Last Seq</span><span class="mg-value dim" id="mg-seq">—</span></div>'
+        '</div>'
+        '</div>'
+        # events
+        '<div class="panel">'
+        '<div class="panel-header">'
+        '<span class="panel-title">Event Feed<span class="panel-title-tag">Live</span></span>'
+        '<span class="panel-meta">last 30</span>'
+        '</div>'
+        '<div class="events" id="events"><div class="empty-state">no events yet</div></div>'
+        '</div>'
+        # orders
+        '<div class="panel">'
+        '<div class="panel-header">'
+        '<span class="panel-title">MT5 Orders</span>'
+        '<span class="panel-meta">last 20</span>'
+        '</div>'
+        '<div class="orders" id="orders"><div class="empty-state">no orders yet</div></div>'
+        '</div>'
+    )
+
+
+_LAUNCHER_JS = r"""
+(function () {
+  const role = "__ROLE__";
+  let snapshot = null;
+  let didFill = false;
+  function ids() {
+    if (role === "central") return ["external_hub_url","token","copy_mode","interval"];
+    return ["hub_url","token","member_name","mt5_files_dir","interval",
+            "default_lot_size","use_martingale","martingale_multiplier","martingale_max_level",
+            "martingale_lots","partial_close_ratios",
+            "cancel_pending_after_seconds","cancel_if_price_beyond_percent",
+            "signal_dedup_minutes","max_open_positions",
+            "source_whitelist","source_blacklist"];
+  }
+  function $(id) { return document.getElementById(id); }
+  function collect() {
+    const out = {};
+    for (const id of ids()) {
+      const el = $(id);
+      if (!el) continue;
+      out[id] = el.type === "checkbox" ? (el.checked ? "true" : "false") : el.value;
+    }
+    return out;
+  }
+  function fill(settings) {
+    for (const id of ids()) {
+      const el = $(id);
+      if (!el) continue;
+      if (el.type === "checkbox") {
+        el.checked = ["true","1","yes","on"].includes(String(settings[id] || "").toLowerCase());
+      } else {
+        el.value = settings[id] || "";
+      }
+    }
+  }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c];
+    });
+  }
+  function fmtTime(ts) {
+    if (!ts) return "—";
+    return new Date(ts * 1000).toLocaleTimeString("zh-TW", { hour12: false });
+  }
+  function fmtRel(ts) {
+    if (!ts) return "—";
+    const diff = (Date.now() / 1000) - ts;
+    if (diff < 5) return "now";
+    if (diff < 60) return Math.floor(diff) + "s";
+    if (diff < 3600) return Math.floor(diff / 60) + "m";
+    if (diff < 86400) return Math.floor(diff / 3600) + "h";
+    return Math.floor(diff / 86400) + "d";
+  }
+  function fmtUptime(s) {
+    if (!s) return "0s";
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
+    return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+  }
+  function clockTick() {
+    const t = new Date();
+    const local = t.toLocaleTimeString("zh-TW", { hour12: false });
+    const utc = t.toISOString().slice(11, 19);
+    const el = $("clock");
+    if (el) el.textContent = local + " · " + utc + "Z";
+  }
+  setInterval(clockTick, 1000);
+  clockTick();
+  async function post(path, data) {
+    data = data || {};
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || "request failed");
+    return json;
+  }
+  function setLivePill(snap) {
+    const pill = $("live-pill");
+    const dot = $("live-dot");
+    const txt = $("live-text");
+    if (!pill || !dot || !txt) return;
+    pill.classList.remove("running", "warn", "err");
+    if (snap.running) {
+      pill.classList.add("running");
+      txt.textContent = snap.paused ? "Paused" : "Running";
+      if (snap.paused) { pill.classList.remove("running"); pill.classList.add("warn"); }
+    } else if (snap.status && /失敗|fail|error/i.test(snap.status)) {
+      pill.classList.add("err");
+      txt.textContent = "Failed";
+    } else {
+      txt.textContent = "Idle";
+    }
+    const upt = $("uptime");
+    if (upt) upt.textContent = snap.running ? fmtUptime(snap.uptime_seconds || 0) : "—";
+    const ip = $("lan-ip");
+    if (ip) ip.textContent = snap.lan_ip || "—";
+  }
+  function renderCaptures(captures) {
+    const root = $("captures");
+    if (!root) return;
+    if (!captures || captures.length === 0) {
+      root.innerHTML = '<div class="empty-state">尚未有複製內容</div>';
+      $("capture-summary").textContent = "0 captures";
+      return;
+    }
+    const newest = captures.slice().reverse();
+    const newCount = newest.reduce(function (a, c) { return a + (c.new_count || 0); }, 0);
+    $("capture-summary").textContent = newest.length + " captures · " + newCount + " new msgs";
+    root.innerHTML = newest.map(function (c) {
+      const stamp = fmtTime(c.captured_at);
+      const status = c.ok
+        ? '<span class="capture-status ok">+' + (c.new_count || 0) + ' new</span>'
+        : '<span class="capture-status bad">fail</span>';
+      const msgs = (c.new_messages || []).map(function (m) {
+        return '<div class="capture-msg"><div class="capture-msg-meta">' +
+          esc(m.time_str || "") + " · " + esc(m.sender || "") +
+          '</div>' + esc(m.body || "") + '</div>';
+      }).join("");
+      const msgsBlock = msgs ? '<div class="capture-msgs">' + msgs + '</div>' : "";
+      const errBlock = (!c.ok && c.error) ? '<div class="capture-msg" style="border-left-color: var(--red); color: var(--red);">' + esc(c.error) + '</div>' : "";
+      return '<div class="capture-card">' +
+        '<div class="capture-meta">' +
+          '<span class="capture-source">▸ ' + esc(c.source || "—") + '</span>' +
+          '<span class="capture-stamp">' + stamp + '</span>' +
+          status +
+        '</div>' +
+        '<div class="capture-text">' + esc(c.raw_text || "—") + '</div>' +
+        msgsBlock + errBlock +
+      '</div>';
+    }).join("");
+  }
+  const KIND_LABEL = {
+    signal_received: "received",
+    submitted: "sent",
+    skipped_dedup: "dedup",
+    skipped_invalid: "invalid",
+    submit_failed: "failed",
+  };
+  function renderClientPanels(snap) {
+    // pause button + telemetry meta
+    const pauseBtn = $("pauseToggle");
+    if (pauseBtn) pauseBtn.textContent = snap.paused ? "▶  恢復跟單" : "❚❚  暫停跟單";
+    const tm = $("telemetry-meta");
+    if (tm) tm.textContent = (snap.member_name || snap.client_id || "—") + " · " + (snap.client_id || "—");
+    // martingale strip
+    const mst = $("mg-status");
+    if (mst) {
+      if (!snap.running) { mst.textContent = "IDLE"; mst.className = "mg-value dim"; }
+      else if (snap.paused) { mst.textContent = "PAUSED"; mst.className = "mg-value amber"; }
+      else { mst.textContent = "ACTIVE"; mst.className = "mg-value green"; }
+    }
+    const ml = $("mg-level");
+    const mm = $("mg-mode");
+    if (ml) ml.textContent = "L" + (snap.martingale_level || 0);
+    if (mm) mm.textContent = snap.martingale_enabled ? "enabled · escalating" : "disabled · flat";
+    const mp = $("mg-positions");
+    const mpc = $("mg-positions-cap");
+    if (mp) mp.textContent = String(snap.active_positions || 0);
+    if (mpc) mpc.textContent = snap.max_open_positions ? "cap " + snap.max_open_positions : "no cap";
+    const ms = $("mg-seq");
+    if (ms) ms.textContent = "#" + (snap.last_seq || 0);
+    // events
+    const evRoot = $("events");
+    if (evRoot) {
+      const events = (snap.recent_events || []).slice().reverse();
+      if (events.length === 0) {
+        evRoot.innerHTML = '<div class="empty-state">no events yet</div>';
+      } else {
+        evRoot.innerHTML = events.map(function (e) {
+          const kindClass = KIND_LABEL[e.kind] ? e.kind : "unknown";
+          const label = KIND_LABEL[e.kind] || (e.kind || "—");
+          let extra = "";
+          if (e.kind === "submitted") {
+            extra = "lot " + (e.lot_size || "—") + " · L" + (e.martingale_level || 0) + " · seq #" + (e.seq || 0);
+          } else if (e.seq != null) {
+            extra = "seq #" + e.seq;
+          }
+          if (e.source) extra = (extra ? extra + " · " : "") + e.source;
+          return '<div class="event">' +
+            '<span class="event-time">' + fmtTime(e.time) + '</span>' +
+            '<span class="event-kind ' + kindClass + '">' + esc(label) + '</span>' +
+            '<div>' +
+              '<div class="event-summary">' + esc(e.summary || "—") + '</div>' +
+              (extra ? '<div class="event-extra">' + esc(extra) + '</div>' : "") +
+            '</div>' +
+          '</div>';
+        }).join("");
+      }
+    }
+    // orders
+    const orRoot = $("orders");
+    if (orRoot) {
+      const orders = (snap.orders || []).slice().reverse();
+      if (orders.length === 0) {
+        orRoot.innerHTML = '<div class="empty-state">no orders yet</div>';
+      } else {
+        orRoot.innerHTML = orders.map(function (o) {
+          const t = o.entry_time ? fmtTime(o.entry_time) : "—";
+          let entry;
+          if (o.entry === null || o.entry === undefined) entry = "—";
+          else if (typeof o.entry === "number") entry = o.entry.toFixed(2);
+          else entry = String(o.entry);
+          const sl = (o.sl == null) ? "—" : Number(o.sl).toFixed(2);
+          const ticket = o.ticket ? "#" + o.ticket : "—";
+          const dirCls = (o.direction || "").toLowerCase() === "buy" ? "buy" : ((o.direction || "").toLowerCase() === "sell" ? "sell" : "");
+          const status = (o.status || "").toLowerCase();
+          return '<div class="order">' +
+            '<span class="order-time">' + t + '</span>' +
+            '<span class="order-status-tag ' + esc(status) + '">' + esc(o.status || "—") + '</span>' +
+            '<div class="order-main">' +
+              '<span class="order-dir ' + dirCls + '">' + esc(o.direction || "—") + '</span>' +
+              '<span class="order-price">' + esc(String(entry)) + '</span>' +
+              '<span style="color: var(--text-faint); font-size: 10px;">SL ' + esc(sl) + '</span>' +
+              '<span style="color: var(--text-dim); font-size: 10px;">TP ' + esc(o.tps || "—") + '</span>' +
+              '<span class="order-meta">' + ticket + ' · ' + esc(o.source || "—") + '</span>' +
+            '</div>' +
+            '<span class="order-lot">' + esc(String(o.lot != null ? o.lot : "—")) + '</span>' +
+          '</div>';
+        }).join("");
+      }
+    }
+  }
+  async function refresh() {
+    try {
+      const res = await fetch("/api/status");
+      snapshot = await res.json();
+      if (!snapshot.ok) return;
+      if (!didFill) { fill(snapshot.settings); didFill = true; }
+      const statusText = $("status-text");
+      if (statusText) statusText.textContent = snapshot.status;
+      setLivePill(snapshot);
+      const logs = $("logs");
+      if (logs) {
+        logs.textContent = (snapshot.logs || []).join("\n");
+        logs.scrollTop = logs.scrollHeight;
+      }
+      if (role === "central") {
+        const url = (snapshot.settings || {}).external_hub_url || "";
+        const hint = $("hint");
+        if (hint) {
+          if (url) {
+            hint.classList.add("gold");
+            hint.textContent = "▸ 會員端 Hub URL 填：" + url;
+          } else {
+            hint.classList.remove("gold");
+            hint.textContent = "請填入雲端 Hub URL 後再按 START";
+          }
+        }
+        renderCaptures(snapshot.latest_captures);
+      } else {
+        renderClientPanels(snapshot);
+      }
+    } catch (e) {
+      const pill = $("live-pill"); const txt = $("live-text");
+      if (pill && txt) { pill.classList.remove("running","warn"); pill.classList.add("err"); txt.textContent = "Offline"; }
+    }
+  }
+  // bindings
+  function bind(id, handler) { const el = $(id); if (el) el.onclick = handler; }
+  bind("start", function () { post("/api/start", collect()).then(refresh).catch(function (e) { alert(e.message); }); });
+  bind("stop", function () { post("/api/stop").then(refresh).catch(function (e) { alert(e.message); }); });
+  bind("quit", function () {
+    post("/api/quit").then(function () {
+      document.body.innerHTML = '<main style="padding:60px 24px;text-align:center;"><div style="font-family:var(--font-display);font-style:italic;color:var(--gold);font-size:32px;">— 程式已關閉 —</div><div style="margin-top:18px;color:var(--text-faint);letter-spacing:0.16em;text-transform:uppercase;font-size:11px;">XAU/Signal · session ended</div></main>';
+    }).catch(function (e) { alert(e.message); });
+  });
+  bind("testHub", function () {
+    post("/api/test-hub", collect()).then(function (j) {
+      alert("連線成功 latest_seq=" + j.health.latest_seq);
+    }).catch(function (e) { alert(e.message); });
+  });
+  bind("pauseToggle", function () {
+    const next = !(snapshot && snapshot.paused);
+    post("/api/pause", { paused: next }).then(refresh).catch(function (e) { alert(e.message); });
+  });
+  bind("closeAll", function () {
+    if (!confirm("確認要全部撤單 + 全部平倉嗎？")) return;
+    post("/api/close-all").then(function (j) {
+      const r = j.result || {};
+      alert("完成：撤 " + (r.cancelled || 0) + " 平 " + (r.closed || 0) + " 失敗 " + (r.failed || 0));
+      refresh();
+    }).catch(function (e) { alert(e.message); });
+  });
+  bind("resetMg", function () {
+    if (!confirm("把馬丁層級歸零嗎？")) return;
+    post("/api/reset-martingale").then(refresh).catch(function (e) { alert(e.message); });
+  });
+  refresh();
+  setInterval(refresh, 1000);
+})();
+"""
+
+
 def _page_html(state: LauncherState) -> str:
     is_central = state.role == "central"
+    role_tag = "Signal Capture" if is_central else "Copy Trader"
+    role_subtitle = "LINE → Cloud Hub" if is_central else "Cloud Hub → MT5"
+
     if is_central:
-        fields = """
-      <label>雲端 Hub URL<input id="external_hub_url" placeholder="例如 https://gold-signal-hub-tw.fly.dev" /></label>
-      <label>Hub 密碼<input id="token" type="password" /></label>
-      <label>複製模式<select id="copy_mode"><option value="all">全選複製</option><option value="tail">底部幾屏</option></select></label>
-      <label>輪詢秒數<input id="interval" /></label>
-    """
+        settings_html = _central_settings_html()
+        right_panel = _central_right_panel()
+        runtime_buttons = ""
         extra_button = ""
+        hint_html = '<div class="hint-row" id="hint">請填入雲端 Hub URL 後再按 START</div>'
     else:
-        fields = """
-      <h3 class="grouph">連線</h3>
-      <label>中央 Hub URL<input id="hub_url" placeholder="http://中央電腦IP:8765" /></label>
-      <label>Hub 密碼<input id="token" type="password" /></label>
-      <label>MT5 Files 路徑<input id="mt5_files_dir" placeholder="可留空自動偵測" /></label>
-      <label>輪詢秒數<input id="interval" /></label>
+        settings_html = _client_settings_html()
+        right_panel = _client_right_panel()
+        runtime_buttons = (
+            '<div class="button-row runtime">'
+            '<button class="btn warn" id="pauseToggle"><span class="button-glyph"></span>暫停跟單</button>'
+            '<button class="btn danger" id="closeAll"><span class="button-glyph"></span>一鍵全平倉</button>'
+            '<button class="btn" id="resetMg"><span class="button-glyph"></span>重置馬丁</button>'
+            '</div>'
+        )
+        extra_button = '<button class="btn" id="testHub"><span class="button-glyph"></span>Test Hub</button>'
+        hint_html = ""
 
-      <h3 class="grouph">下單</h3>
-      <label>預設手數<input id="default_lot_size" placeholder="0.01" /></label>
-      <label>啟用馬丁<input id="use_martingale" type="checkbox" /></label>
-      <label>馬丁倍數<input id="martingale_multiplier" placeholder="2.0" /></label>
-      <label>馬丁最大層級<input id="martingale_max_level" placeholder="4" /></label>
-      <label>自訂每層手數<input id="martingale_lots" placeholder="例 0.01,0.02,0.04,0.08（留空 = 用倍數公式）" /></label>
-      <label>分批 TP 比例<input id="partial_close_ratios" placeholder="0.5,0.3,0.2" /></label>
+    primary_button_label = "Start Service"
 
-      <h3 class="grouph">風控</h3>
-      <label>掛單取消秒數<input id="cancel_pending_after_seconds" placeholder="7200" /></label>
-      <label>取消偏離 %<input id="cancel_if_price_beyond_percent" placeholder="1.0" /></label>
-      <label>訊號 dedup 分鐘<input id="signal_dedup_minutes" placeholder="10" /></label>
-      <label>最大同時持倉<input id="max_open_positions" placeholder="10" /></label>
-    """
-        extra_button = "<button id=\"testHub\">測試 Hub</button>"
-
-    sections_html = f"""
-      <section><h2>設定</h2>{fields}<p class="muted" id="hint"></p></section>
-      <section><button class="primary" id="start">開始</button><button id="stop">停止</button>{extra_button}<button class="danger" id="quit">關閉程式</button></section>
-      <section><h2>狀態紀錄</h2><div id="logs"></div></section>"""
-
-    if is_central:
-        right_panel = """
-    <aside class="col-right">
-      <section>
-        <h2>複製內容預覽</h2>
-        <p class="muted" id="capturesHint">服務啟動後每次複製到的訊息會出現在這裡（最多保留 8 筆）</p>
-        <div id="captures"></div>
-      </section>
-    </aside>"""
-    else:
-        right_panel = """
-    <aside class="col-right">
-      <section>
-        <h2>馬丁狀態</h2>
-        <p id="martingaleStatus" class="muted">尚未啟動</p>
-      </section>
-      <section>
-        <h2>最近事件</h2>
-        <p class="muted">收到 Hub 訊號 / 跳過 / 送 MT5 / 失敗（最多保留 30 筆）</p>
-        <div id="events"></div>
-      </section>
-      <section>
-        <h2>MT5 訂單狀態</h2>
-        <p class="muted">最近 20 筆，含掛單 / 已成交 / 已平倉 / 已取消</p>
-        <div id="orders"></div>
-      </section>
-    </aside>"""
-
-    body_main = f"""
-  <main class="split">
-    <div class="col-left">{sections_html}
-    </div>{right_panel}
-  </main>"""
-
-    return f"""<!doctype html>
+    template = """<!doctype html>
 <html lang="zh-Hant">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{state.title}</title>
-  <style>
-    :root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    body {{ margin: 0; background: #f5f7f8; color: #17202a; }}
-    header {{ padding: 18px 24px; background: #fff; border-bottom: 1px solid #dfe4e8; display: flex; justify-content: space-between; align-items: center; }}
-    h1 {{ margin: 0; font-size: 21px; }}
-    main {{ max-width: 920px; margin: 0 auto; padding: 22px; }}
-    main.split {{ max-width: 1400px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; align-items: start; }}
-    @media (max-width: 1100px) {{ main.split {{ grid-template-columns: 1fr; }} }}
-    .col-left, .col-right {{ min-width: 0; }}
-    section {{ background: #fff; border: 1px solid #dfe4e8; border-radius: 8px; padding: 18px; margin-bottom: 14px; }}
-    label {{ display: grid; grid-template-columns: 160px 1fr; align-items: center; gap: 12px; margin: 10px 0; color: #52616f; }}
-    input, select {{ font: inherit; padding: 9px 10px; border: 1px solid #cad2d8; border-radius: 6px; }}
-    button {{ font: inherit; padding: 9px 14px; border: 1px solid #9aa7b2; border-radius: 6px; background: #fff; cursor: pointer; margin-right: 8px; }}
-    button.primary {{ background: #1450a3; color: #fff; border-color: #1450a3; }}
-    button.danger {{ color: #a12a2a; border-color: #d7a4a4; }}
-    #logs {{ height: 240px; overflow: auto; white-space: pre-wrap; background: #111820; color: #d7e3ee; padding: 12px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }}
-    .muted {{ color: #6b7785; }}
-    .capture-card {{ background: #fbfcfd; border: 1px solid #e2e6ea; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }}
-    .capture-meta {{ color: #6b7785; font-size: 12px; margin-bottom: 6px; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }}
-    .capture-source {{ font-weight: 600; color: #1450a3; }}
-    .capture-text {{ white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 220px; overflow: auto; background: #f3f5f7; padding: 8px; border-radius: 4px; color: #1f2933; }}
-    .capture-msgs {{ margin-top: 8px; padding-top: 8px; border-top: 1px dashed #e2e6ea; }}
-    .capture-msg {{ background: #eef5ff; padding: 6px 8px; border-radius: 4px; margin: 4px 0; font-size: 12px; white-space: pre-wrap; }}
-    .capture-msg-meta {{ color: #6b7785; font-size: 11px; margin-bottom: 2px; }}
-    .capture-empty {{ color: #6b7785; font-size: 12px; padding: 20px; text-align: center; }}
-    h3.grouph {{ margin: 18px 0 6px 0; padding: 0; font-size: 13px; color: #1450a3; border-bottom: 1px solid #e2e6ea; padding-bottom: 4px; }}
-    h3.grouph:first-child {{ margin-top: 0; }}
-    .event-card {{ display: grid; grid-template-columns: 70px 90px 1fr; gap: 8px; padding: 6px 10px; border-bottom: 1px solid #f0f3f5; font-size: 12px; align-items: baseline; }}
-    .event-card:last-child {{ border-bottom: none; }}
-    .event-time {{ color: #8a96a4; font-family: ui-monospace, monospace; }}
-    .event-kind {{ font-weight: 600; }}
-    .event-kind.signal_received {{ color: #1450a3; }}
-    .event-kind.submitted {{ color: #2d8659; }}
-    .event-kind.skipped_dedup {{ color: #b08400; }}
-    .event-kind.skipped_invalid {{ color: #b08400; }}
-    .event-kind.submit_failed {{ color: #a12a2a; }}
-    .event-summary {{ color: #1f2933; word-break: break-word; }}
-    .event-extra {{ color: #6b7785; font-size: 11px; }}
-    .order-card {{ display: grid; grid-template-columns: 70px 70px 1fr; gap: 8px; padding: 6px 10px; border-bottom: 1px solid #f0f3f5; font-size: 12px; align-items: baseline; }}
-    .order-card:last-child {{ border-bottom: none; }}
-    .order-status {{ font-weight: 600; padding: 2px 6px; border-radius: 4px; font-size: 11px; text-align: center; }}
-    .order-status.pending {{ background: #fff3cd; color: #856404; }}
-    .order-status.sent {{ background: #cce5ff; color: #004085; }}
-    .order-status.filled {{ background: #d4edda; color: #155724; }}
-    .order-status.partial {{ background: #d4edda; color: #155724; }}
-    .order-status.closed {{ background: #e2e3e5; color: #383d41; }}
-    .order-status.cancelled {{ background: #e2e3e5; color: #6c757d; }}
-    .order-status.failed {{ background: #f8d7da; color: #721c24; }}
-    .empty-block {{ color: #6b7785; font-size: 12px; padding: 16px; text-align: center; }}
-  </style>
+  <title>__TITLE__</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&family=JetBrains+Mono:wght@300;400;500;600;700&family=Noto+Sans+TC:wght@300;400;500;600;700&family=Noto+Serif+TC:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>__CSS__</style>
 </head>
 <body>
-  <header><h1>{state.title}</h1><strong id="status">載入中</strong></header>
-{body_main}
-  <script>
-    const role = {json.dumps(state.role)};
-    let snapshot = null;
-    let didFill = false;
-    function ids() {{
-      if (role === "central") return ["external_hub_url","token","copy_mode","interval"];
-      return ["hub_url","token","mt5_files_dir","interval",
-              "default_lot_size","use_martingale","martingale_multiplier","martingale_max_level",
-              "martingale_lots","partial_close_ratios",
-              "cancel_pending_after_seconds","cancel_if_price_beyond_percent",
-              "signal_dedup_minutes","max_open_positions"];
-    }}
-    function collect() {{
-      const out = {{}};
-      for (const id of ids()) {{
-        const el = document.getElementById(id);
-        out[id] = el.type === "checkbox" ? (el.checked ? "true" : "false") : el.value;
-      }}
-      return out;
-    }}
-    function fill(settings) {{
-      for (const id of ids()) if (document.getElementById(id)) {{
-        const el = document.getElementById(id);
-        if (el.type === "checkbox") el.checked = ["true", "1", "yes", "on"].includes(String(settings[id] || "").toLowerCase());
-        else el.value = settings[id] || "";
-      }}
-    }}
-    function escapeHtml(s) {{
-      return String(s ?? "").replace(/[&<>"']/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}})[c]);
-    }}
-    function renderCaptures(captures) {{
-      const root = document.getElementById("captures");
-      if (!root) return;
-      if (!captures || captures.length === 0) {{
-        root.innerHTML = '<p class="capture-empty">尚未有複製內容</p>';
-        return;
-      }}
-      const newest = captures.slice().reverse();
-      root.innerHTML = newest.map(c => {{
-        const t = new Date((c.captured_at || 0) * 1000);
-        const stamp = t.toLocaleTimeString("zh-TW", {{ hour12: false }});
-        const status = c.ok ? `新訊息 ${{c.new_count || 0}} 則` : `失敗：${{escapeHtml(c.error || "")}}`;
-        const msgs = (c.new_messages || []).map(m =>
-          `<div class="capture-msg"><div class="capture-msg-meta">${{escapeHtml(m.time_str || "")}} ${{escapeHtml(m.sender || "")}}</div>${{escapeHtml(m.body || "")}}</div>`
-        ).join("");
-        const msgsBlock = msgs ? `<div class="capture-msgs">${{msgs}}</div>` : "";
-        return `<div class="capture-card">
-          <div class="capture-meta"><span class="capture-source">${{escapeHtml(c.source || "")}}</span><span>${{stamp}} · ${{status}}</span></div>
-          <div class="capture-text">${{escapeHtml(c.raw_text || "")}}</div>
-          ${{msgsBlock}}
-        </div>`;
-      }}).join("");
-    }}
-    async function post(path, data={{}}) {{
-      const res = await fetch(path, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: JSON.stringify(data) }});
-      const json = await res.json();
-      if (!json.ok) throw new Error(json.error || "request failed");
-      return json;
-    }}
-    async function refresh() {{
-      const res = await fetch("/api/status");
-      snapshot = await res.json();
-      if (!snapshot.ok) return;
-      if (!didFill) {{
-        fill(snapshot.settings);
-        didFill = true;
-      }}
-      document.getElementById("status").textContent = snapshot.status + (snapshot.running ? ` (${{snapshot.uptime_seconds}}s)` : "");
-      document.getElementById("logs").textContent = (snapshot.logs || []).join("\\n");
-      document.getElementById("logs").scrollTop = document.getElementById("logs").scrollHeight;
-      if (role === "central") {{
-        const url = snapshot.settings.external_hub_url || "";
-        document.getElementById("hint").textContent = url
-          ? `會員端 Hub URL 填：${{url}}`
-          : "請填入雲端 Hub URL 後再按開始";
-        renderCaptures(snapshot.latest_captures);
-      }} else {{
-        renderClientPanels(snapshot);
-      }}
-    }}
-    function fmtTime(ts) {{
-      if (!ts) return "";
-      return new Date(ts * 1000).toLocaleTimeString("zh-TW", {{ hour12: false }});
-    }}
-    const KIND_LABEL = {{
-      signal_received: "收到訊號",
-      submitted: "送 MT5",
-      skipped_dedup: "跳過（重複）",
-      skipped_invalid: "跳過（不完整）",
-      submit_failed: "MT5 失敗",
-    }};
-    function renderClientPanels(snap) {{
-      // 馬丁狀態
-      const ms = document.getElementById("martingaleStatus");
-      if (ms) {{
-        if (snap.martingale_enabled) {{
-          ms.textContent = `啟用中 — 目前層級 ${{snap.martingale_level || 0}}（last_seq=${{snap.last_seq || 0}}）`;
-          ms.classList.remove("muted");
-        }} else {{
-          ms.textContent = `關閉（均注模式）— last_seq=${{snap.last_seq || 0}}`;
-          ms.classList.add("muted");
-        }}
-      }}
-      // 事件
-      const evRoot = document.getElementById("events");
-      if (evRoot) {{
-        const events = (snap.recent_events || []).slice().reverse();
-        if (events.length === 0) {{
-          evRoot.innerHTML = '<p class="empty-block">尚未有事件</p>';
-        }} else {{
-          evRoot.innerHTML = events.map(e => {{
-            const label = KIND_LABEL[e.kind] || e.kind;
-            const extra = e.kind === "submitted" ? `<div class="event-extra">手數 ${{e.lot_size || ""}} · 馬丁 L${{e.martingale_level || 0}} · seq=${{e.seq || 0}}</div>` :
-                          e.seq != null ? `<div class="event-extra">seq=${{e.seq}}</div>` : "";
-            return `<div class="event-card">
-              <span class="event-time">${{fmtTime(e.time)}}</span>
-              <span class="event-kind ${{e.kind}}">${{escapeHtml(label)}}</span>
-              <div class="event-summary">${{escapeHtml(e.summary || "")}}<div class="event-extra">${{escapeHtml(e.source || "")}}</div>${{extra}}</div>
-            </div>`;
-          }}).join("");
-        }}
-      }}
-      // 訂單
-      const orRoot = document.getElementById("orders");
-      if (orRoot) {{
-        const orders = (snap.orders || []).slice().reverse();
-        if (orders.length === 0) {{
-          orRoot.innerHTML = '<p class="empty-block">尚未有訂單</p>';
-        }} else {{
-          orRoot.innerHTML = orders.map(o => {{
-            const t = o.entry_time ? fmtTime(o.entry_time) : "—";
-            const entry = (o.entry === null || o.entry === undefined) ? "-" : (typeof o.entry === "number" ? o.entry.toFixed(2) : o.entry);
-            const sl = (o.sl === null || o.sl === undefined) ? "-" : Number(o.sl).toFixed(2);
-            const ticket = o.ticket ? `#${{o.ticket}}` : "—";
-            return `<div class="order-card">
-              <span class="event-time">${{t}}</span>
-              <span class="order-status ${{o.status}}">${{escapeHtml(o.status)}}</span>
-              <div>
-                <strong>${{escapeHtml(o.direction || "")}}</strong> @ ${{escapeHtml(String(entry))}} · SL ${{escapeHtml(String(sl))}} · TP ${{escapeHtml(o.tps || "-")}}
-                <div class="event-extra">手數 ${{escapeHtml(String(o.lot ?? ""))}} · ${{ticket}} · ${{escapeHtml(o.source || "")}}</div>
-              </div>
-            </div>`;
-          }}).join("");
-        }}
-      }}
-    }}
-    document.getElementById("start").onclick = () => post("/api/start", collect()).then(refresh).catch(e => alert(e.message));
-    document.getElementById("stop").onclick = () => post("/api/stop").then(refresh).catch(e => alert(e.message));
-    document.getElementById("quit").onclick = () => post("/api/quit").then(() => document.body.innerHTML = "<main><section><h1>程式已關閉</h1></section></main>").catch(e => alert(e.message));
-    if (document.getElementById("testHub")) document.getElementById("testHub").onclick = () => post("/api/test-hub", collect()).then(j => alert(`連線成功 latest_seq=${{j.health.latest_seq}}`)).catch(e => alert(e.message));
-    refresh();
-    setInterval(refresh, 1000);
-  </script>
+  <div class="topbar">
+    <div class="brand">
+      <span class="brand-mark">XAU/Signal</span>
+      <span class="brand-meta">__ROLE_TAG__</span>
+      <span class="role-tag">__ROLE_UPPER__</span>
+    </div>
+    <div class="title-display">__ROLE_SUBTITLE__</div>
+    <div class="topbar-status">
+      <span class="meta-pill"><span class="lbl">LAN</span><span id="lan-ip">—</span></span>
+      <span class="meta-pill"><span class="lbl">Uptime</span><span id="uptime">—</span></span>
+      <span class="meta-pill"><span class="lbl">Status</span><span id="status-text">載入中</span></span>
+      <span class="live-pill" id="live-pill"><span class="live-dot" id="live-dot"></span><span id="live-text">Idle</span></span>
+      <span class="clock" id="clock">—</span>
+    </div>
+  </div>
+  <main>
+    <div class="col">
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Configuration<span class="panel-title-tag">__ROLE_UPPER__</span></span>
+          <span class="panel-meta">設定即時儲存</span>
+        </div>
+        <div class="button-row">
+          <button class="btn primary" id="start"><span class="button-glyph"></span>__PRIMARY_LABEL__</button>
+          <button class="btn" id="stop"><span class="button-glyph"></span>Stop</button>
+          __EXTRA_BUTTON__
+          <button class="btn danger" id="quit" style="margin-left:auto;"><span class="button-glyph"></span>Quit</button>
+        </div>
+        __RUNTIME_BUTTONS__
+        __HINT__
+        __SETTINGS__
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Service Log<span class="panel-title-tag">tail</span></span>
+          <span class="panel-meta" id="log-meta">last 200 lines</span>
+        </div>
+        <div class="logs" id="logs">awaiting log stream…</div>
+      </div>
+    </div>
+    <div class="col">
+      __RIGHT_PANEL__
+    </div>
+  </main>
+  <script>__JS__</script>
 </body>
 </html>"""
+
+    js = _LAUNCHER_JS.replace("__ROLE__", state.role)
+    return (
+        template
+        .replace("__CSS__", _LAUNCHER_CSS)
+        .replace("__JS__", js)
+        .replace("__TITLE__", state.title)
+        .replace("__ROLE_TAG__", role_tag)
+        .replace("__ROLE_UPPER__", state.role.upper())
+        .replace("__ROLE_SUBTITLE__", role_subtitle)
+        .replace("__SETTINGS__", settings_html)
+        .replace("__RIGHT_PANEL__", right_panel)
+        .replace("__RUNTIME_BUTTONS__", runtime_buttons)
+        .replace("__EXTRA_BUTTON__", extra_button)
+        .replace("__HINT__", hint_html)
+        .replace("__PRIMARY_LABEL__", primary_button_label)
+    )
 
 
 def _install_logging(state: LauncherState) -> None:

@@ -29,3 +29,7 @@ central_client_state.json
 central_processed.json
 central_hub_signals.jsonl
 martingale_state.json
+
+# UI preview scaffolding — local design iteration only, not for deploy
+_ui_preview/
+_make_previews.py
