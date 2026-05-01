@@ -378,7 +378,49 @@ class TradeManager:
         logger.info(f"Manual martingale reset from level {self.current_martingale_level} to 0")
         self.current_martingale_level = 0
         self.consecutive_losses = 0
+        self._source_martingale.clear()
         self._save_martingale_state()
+
+    def active_position_count(self) -> int:
+        """Count orders that hold or will hold an MT5 position (掛單 / 已送 / 已成交 / 部分平倉)."""
+        active_states = (
+            OrderStatus.PENDING,
+            OrderStatus.SENT,
+            OrderStatus.FILLED,
+            OrderStatus.PARTIAL_CLOSED,
+        )
+        with self._lock:
+            return sum(1 for o in self.orders.values() if o.status in active_states)
+
+    def close_all(self, reason: str = "manual_close_all") -> Dict[str, int]:
+        """全平倉 + 全撤掛單。回傳 {cancelled: N, closed: M, failed: K}。
+
+        - PENDING/SENT 直接 cancel（送 delete 給 MT5）
+        - FILLED/PARTIAL_CLOSED 送 close 給 MT5
+        - 不影響馬丁層級（cancel 不算敗,close 走 on_trade_result 計算盈虧）
+        """
+        result = {"cancelled": 0, "closed": 0, "failed": 0}
+        # 收集要動的 signal_id 清單，避免持鎖跨網絡 / 檔案 IO
+        with self._lock:
+            targets = list(self.orders.items())
+        for signal_id, order in targets:
+            try:
+                if order.status in (OrderStatus.PENDING, OrderStatus.SENT):
+                    if self.cancel_order(signal_id, reason=reason):
+                        result["cancelled"] += 1
+                    else:
+                        result["failed"] += 1
+                elif order.status in (OrderStatus.FILLED, OrderStatus.PARTIAL_CLOSED):
+                    if self.cancel_order(signal_id, reason=reason):
+                        result["closed"] += 1
+                    else:
+                        result["failed"] += 1
+            except Exception as exc:
+                logger.exception("close_all 處理 %s 失敗: %s", signal_id, exc)
+                result["failed"] += 1
+        logger.info("close_all 完成: %s", result)
+        self._write_journal("CLOSE_ALL", f"reason={reason} | result={result}")
+        return result
 
     def _load_martingale_state(self):
         """Load martingale state from disk to survive restarts."""

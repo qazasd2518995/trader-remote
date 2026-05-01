@@ -29,14 +29,33 @@ def _window_label(window) -> str:
     return getattr(window, "display_name", "") or getattr(window, "window_name", "") or getattr(window, "name", "")
 
 
+# 價格容忍粒度：把所有價格四捨五入到最近的 PRICE_BUCKET（整數），讓
+# OCR / 作者修字產生的小幅 jitter (±1~2) 不會把同訊號當成不同訊號。
+# 黃金 SL / TP 通常彼此相距 5~30 USD，PRICE_BUCKET=2 可以吸收 jitter
+# 又不會誤把不同 setup 黏成同一筆。
+PRICE_BUCKET = 2.0
+
+
+def _bucket_price(value) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return round(float(value) / PRICE_BUCKET) * PRICE_BUCKET
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _signal_key(signal: ParsedSignal, source: str) -> Tuple:
-    tps = tuple(round(float(tp), 2) for tp in (signal.take_profit or []) if tp is not None)
+    """Dedup key. 故意忽略 entry 與 is_market_order — 同一筆訊號常見變體：
+    - 第一次貼「市價」第二次補「掛 4884」(同訊號不同進場語意)
+    - OCR entry 抖動 4884 vs 4884.5
+    比對 SL+TPs+方向+來源即可有效識別「這是同一張單」。
+    """
+    tps = tuple(sorted(_bucket_price(tp) for tp in (signal.take_profit or []) if tp is not None))
     return (
         source,
         signal.direction,
-        round(float(signal.entry_price or 0), 2),
-        bool(signal.is_market_order),
-        round(float(signal.stop_loss or 0), 2),
+        _bucket_price(signal.stop_loss),
         tps,
     )
 
@@ -105,6 +124,11 @@ class CentralSignalCollector:
     # 訊息時間超過這個值就不送（避免會員端剛開機補單時把幾小時前的舊訊號當新的送出去）
     MAX_MESSAGE_AGE_SECONDS = 30 * 60
 
+    # 同一個 source 連續兩次發布的最小間隔（秒）。LINE OCR + 滾動會在短時間內
+    # 重抓到同一張圖；即使內容雷同 dedup 已擋下，這個 throttle 是第二層保險，
+    # 順便處理「作者把同一張單貼第二次微調文字」的情況。
+    PER_SOURCE_PUBLISH_COOLDOWN = 30.0
+
     def __init__(
         self,
         config: Config,
@@ -118,6 +142,8 @@ class CentralSignalCollector:
         self.copy_mode = copy_mode
         self._pending: Dict[str, Dict] = {}
         self._processed: Dict[Tuple, float] = {}
+        # 每個 source 上次成功發布的時間戳，用來節流連續重抓
+        self._last_publish_at: Dict[str, float] = {}
         # 已發布訊號的 dedup TTL — 至少 24 小時（避免歷史訊息在使用者方便的時間視窗內重複下單）
         self._processed_ttl = max(86400, int(config.signal_dedup_minutes or 10) * 60)
         self._processed_path = DATA_DIR / "central_processed.json"
@@ -179,6 +205,7 @@ class CentralSignalCollector:
         - 收集所有 messages 走完 pending merge 之後 complete 的訊號（依在 LINE 中出現的順序）
         - 從中取最後一筆（最新的）
         - 檢查 _processed dedup：若最新訊號已發布過 → 整批跳過、不退回更舊的
+        - 同一 source 在 PER_SOURCE_PUBLISH_COOLDOWN 內已發布 → 一律跳過
         - 否則發布最新訊號 → mark seen 全部 messages
         """
         source_name = cap.source_name
@@ -207,6 +234,17 @@ class CentralSignalCollector:
             self.clipboard.mark_seen(source_name, cap.new_messages)
             return 0
 
+        # Per-source 節流：同一 source 短時間內只發一筆
+        last = self._last_publish_at.get(source_name, 0.0)
+        elapsed = time.time() - last
+        if last and elapsed < self.PER_SOURCE_PUBLISH_COOLDOWN:
+            logger.info(
+                "source=%s 上次發布 %.0fs 前 (<%.0fs cooldown)，跳過：%s",
+                source_display, elapsed, self.PER_SOURCE_PUBLISH_COOLDOWN, final_signal,
+            )
+            self.clipboard.mark_seen(source_name, cap.new_messages)
+            return 0
+
         try:
             self._publish_signal(final_signal, final_msg, source_name, source_display)
         except (urllib.error.URLError, TimeoutError, RuntimeError) as exc:
@@ -218,6 +256,7 @@ class CentralSignalCollector:
             self.clipboard.mark_seen(source_name, cap.new_messages)
             return 0
 
+        self._last_publish_at[source_name] = time.time()
         self.clipboard.mark_seen(source_name, cap.new_messages)
         return 1
 
@@ -300,15 +339,27 @@ class CentralSignalCollector:
 
     @staticmethod
     def _normalize_key(raw) -> Tuple:
-        """JSON 反序列化後 list 還原成 _signal_key 的 tuple 形態，否則 dedup 比對對不上。"""
-        return (
-            str(raw[0]),
-            str(raw[1]),
-            float(raw[2]),
-            bool(raw[3]),
-            float(raw[4]),
-            tuple(float(x) for x in (raw[5] or [])),
-        )
+        """JSON 反序列化後 list 還原成 _signal_key 的 tuple。
+
+        新格式 4 欄：(source, direction, sl_bucket, tps_bucket_tuple)。
+        舊格式 6 欄(含 entry / is_market)的紀錄會被 try-fallback 兼容 — 最後三欄取 sl 與 tps。
+        """
+        try:
+            if len(raw) >= 6:
+                return (
+                    str(raw[0]),
+                    str(raw[1]),
+                    float(raw[4]),
+                    tuple(sorted(float(x) for x in (raw[5] or []))),
+                )
+            return (
+                str(raw[0]),
+                str(raw[1]),
+                float(raw[2]),
+                tuple(sorted(float(x) for x in (raw[3] or []))),
+            )
+        except (TypeError, ValueError, IndexError):
+            return ("", "", 0.0, tuple())
 
     def _load_processed(self) -> None:
         path = self._processed_path
@@ -366,9 +417,13 @@ class CentralSignalCollector:
         })
 
     def _candidate_signals(self, body: str) -> List[ParsedSignal]:
-        signals = self.parser.parse_all_latest(body)
-        if signals:
-            return signals
+        """只回傳「最新時間戳區塊」中的單一訊號。
+
+        舊版用 parse_all_latest 在發現多個方向關鍵字時會切成多訊號回傳，但實務上
+        誤判率高（聊天裡上下文常出現第二個 buy/sell 字樣，或舊訊號沒滾掉）。
+        改成只回最新一筆 — 配合 _process_capture 取最新+per-source cooldown，
+        多筆同時下單的情況基本就被擋住。
+        """
         sig = self.parser.parse_latest(body)
         return [sig] if sig.is_valid or sig.direction else []
 
